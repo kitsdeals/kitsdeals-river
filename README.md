@@ -30,19 +30,21 @@ real-time, structured stream of approved deals built for agent consumers.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## What's in this PR (v0.1)
+## Status
 
 | Component | Status |
 |---|---|
-| `RiverWatcher` — SSE + reconnect + cursor + filter | ✓ shipped |
-| `Profile` — Pydantic schema, YAML load/save, dedup helpers | ✓ shipped |
-| `DecisionsLog` — JSONL append-only with size-based rotation | ✓ shipped |
-| `Notifier` — protocol + `StdoutNotifier` + `TelegramNotifier` | ✓ shipped |
-| `spawn_claude_evaluator` — agent-wake-up with structured prompt | ☐ PR 37 |
-| Onboarding + update-profile skills | ☐ PR 37 |
-| CLI (`setup`, `run`, `reload`, `profile show/update`) | ☐ PR 37 |
+| `RiverWatcher` — SSE + reconnect + cursor + filter + SIGHUP reload | ✓ |
+| `Profile` — Pydantic schema, YAML load/save, dedup helpers | ✓ |
+| `DecisionsLog` — JSONL append-only with size-based rotation | ✓ |
+| `Notifier` — protocol + `StdoutNotifier` + `TelegramNotifier` | ✓ |
+| `spawn_claude_evaluator` — agent-wake-up with structured prompt | ✓ |
+| `skills/onboarding.md` — agent-facing setup interview | ✓ |
+| `skills/update-profile.md` — agent-facing ongoing refinement | ✓ |
+| CLI (`setup`, `run`, `reload`, `status`, `profile show/update/validate`) | ✓ |
 | `slack`, `discord`, `http_post`, `subprocess` notifiers | ☐ PR 38 |
 | Server-side `GET /v1/quickstart` agent funnel | ☐ PR 38 |
+| Kit's watcher migrated to dual-emit (Telegram + Claude wake-up) | ☐ PR 38 |
 
 ## Install
 
@@ -51,6 +53,40 @@ pip install kitsdeals-river
 ```
 
 (Pre-publish: `pip install -e .` from this directory.)
+
+## Agent-driven setup (the expected install flow)
+
+Paste this repo URL to your Claude Code agent and say:
+
+> Set up Kit's Deals for me — I'm looking for X and Y.
+
+The agent loads `skills/onboarding.md`, runs a short interview (4–6
+questions max), translates your answers to a profile, and starts the
+watcher. You don't see the YAML.
+
+For ongoing changes — *"stop showing me TVs"*, *"I bought one of those"*,
+*"only show me clear wins"* — your agent loads `skills/update-profile.md`
+and translates the natural-language request into a structured CLI edit.
+Live reload via `SIGHUP`, no restart required.
+
+## CLI
+
+The CLI is the agent-facing API to the profile and the watcher daemon.
+Humans rarely run these directly; the skills tell the agent how to use
+them.
+
+```bash
+kitsdeals-river setup --json '<full profile JSON>'      # write profile + start
+kitsdeals-river run                                     # foreground watcher
+kitsdeals-river status                                  # daemon health snapshot
+kitsdeals-river reload                                  # SIGHUP a running watcher
+kitsdeals-river profile show [--json]                   # inspect current profile
+kitsdeals-river profile update --remove-watch "TVs"     # programmatic edits
+kitsdeals-river profile validate                        # well-formedness check
+```
+
+See `skills/onboarding.md` and `skills/update-profile.md` for the agent-
+facing recipes.
 
 ## Minimal example (without an agent in the loop)
 

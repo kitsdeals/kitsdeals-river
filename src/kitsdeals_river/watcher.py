@@ -8,8 +8,10 @@ SSE stream so the calling code can focus on what to do per event:
 - v2 event-envelope parsing (schema_version, event_type, event_id, data)
 - Cursor persistence to disk so a restart doesn't re-process old events
 - REST catch-up on reconnect for events missed during the disconnect
+- SIGHUP-triggered profile reload (PR 37) so the agent can edit
+  ~/.kitsdeals/profile.yaml and have changes pick up live
 
-User code attaches a callback via ``@watcher.on_match(...)`` (or supplies
+User code attaches a callback via ``@watcher.on_event(...)`` (or supplies
 one in the constructor) and runs ``watcher.run()`` to block forever, or
 ``watcher.run_async()`` inside an existing asyncio loop.
 """
@@ -18,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,6 +136,12 @@ class RiverWatcher:
         cursor_path: str | Path = "~/.kitsdeals/cursor.json",
         user_agent: str = DEFAULT_USER_AGENT,
         on_event: Handler | None = None,
+        # PR 37: reload_profile is invoked on SIGHUP. Returns the new
+        # filter so the watcher can swap mid-flight without a restart.
+        # Caller usually wires this to Profile.load(...).filter via a
+        # closure, but anything that returns a WatchFilter (or None to
+        # clear filtering) works.
+        reload_profile: Callable[[], WatchFilter | None] | None = None,
         # Test/extension hooks: each is parameterized so unit tests can
         # inject mocks without monkeypatching globals.
         http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
@@ -143,9 +152,14 @@ class RiverWatcher:
         self.cursor = Cursor(cursor_path)
         self.user_agent = user_agent
         self._on_event: Handler | None = on_event
+        self._reload_profile = reload_profile
         self._http_client_factory = http_client_factory
         self._sleep = sleep
         self._stop = asyncio.Event()
+        # SIGHUP raises this; the consume loop checks between events and
+        # tears down the connection so the next iteration picks up the
+        # new filter on a fresh connect.
+        self._reload_requested = asyncio.Event()
 
     # -- Handler registration -----------------------------------------------
 
@@ -162,9 +176,23 @@ class RiverWatcher:
 
     def run(self) -> None:
         """Block forever, reconnecting on drops. Use this when the watcher
-        is the only thing on the event loop."""
+        is the only thing on the event loop. Wires SIGHUP → reload and
+        SIGTERM/SIGINT → stop so daemon control works the unix way."""
+        async def _wrap():
+            loop = asyncio.get_running_loop()
+            # SIGHUP only exists on POSIX; the add_signal_handler call is
+            # also POSIX-only. On Windows we just silently skip — the user
+            # can still drive reload programmatically via request_reload().
+            try:
+                loop.add_signal_handler(signal.SIGHUP, self.request_reload)
+                loop.add_signal_handler(signal.SIGTERM, self.stop)
+                loop.add_signal_handler(signal.SIGINT, self.stop)
+            except (AttributeError, NotImplementedError):
+                logger.info("signal handlers unavailable on this platform")
+            await self.run_async()
+
         try:
-            asyncio.run(self.run_async())
+            asyncio.run(_wrap())
         except KeyboardInterrupt:
             logger.info("interrupted; stopping")
 
@@ -172,6 +200,7 @@ class RiverWatcher:
         """Same loop for callers that already manage the event loop."""
         backoff = RECONNECT_INITIAL_BACKOFF_SECONDS
         while not self._stop.is_set():
+            self._maybe_apply_reload()
             try:
                 await self._catch_up_via_rest()
                 await self._consume_sse()
@@ -191,6 +220,29 @@ class RiverWatcher:
         """Ask the run loop to shut down. Returns immediately; the loop
         exits at the next iteration."""
         self._stop.set()
+
+    def request_reload(self) -> None:
+        """Ask the run loop to re-read the profile and apply a new filter
+        on the next connect. Safe to call from a signal handler — it just
+        sets a flag.
+        """
+        logger.info("reload requested; will apply on next connect")
+        self._reload_requested.set()
+
+    def _maybe_apply_reload(self) -> None:
+        if not self._reload_requested.is_set() or self._reload_profile is None:
+            self._reload_requested.clear()
+            return
+        try:
+            new_filter = self._reload_profile()
+            self.filter = new_filter
+            logger.info("profile reloaded; new filter: %s", new_filter)
+        except Exception:
+            # Don't let a bad profile take down the watcher; keep the
+            # old filter and try again on the next reload signal.
+            logger.exception("profile reload failed; keeping previous filter")
+        finally:
+            self._reload_requested.clear()
 
     # -- Internals ----------------------------------------------------------
 
@@ -282,6 +334,12 @@ class RiverWatcher:
                             last_event_id=event.event_id,
                             last_occurred_at=event.occurred_at,
                         )
+                    # PR 37: between-events check for stop / reload. Tearing
+                    # the connection here is the cleanest way to apply a new
+                    # filter — the loop reconnects with the updated query
+                    # params on the next iteration.
+                    if self._stop.is_set() or self._reload_requested.is_set():
+                        return
 
     async def _dispatch(self, event: RiverEvent) -> None:
         if self._on_event is None:
