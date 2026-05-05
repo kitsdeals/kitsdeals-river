@@ -1,12 +1,17 @@
 """Generic HTTP POST notifier — for any inbound HTTPS endpoint.
 
-For agents on platforms that publish a callback URL (Gemini, Cloudflare
-Workers, Lambda, your own service). Posts a JSON body with both the
-rendered ``message`` and the full ``deal`` payload, so the receiver
-can render its own copy if desired.
+For deployment-shaped runtimes that can host a callback URL
+(Cloudflare Workers, AWS Lambda + API Gateway, Vercel functions, a
+self-hosted service). Posts a JSON body with both the rendered
+``message`` and the full ``deal`` payload, so the receiver can render
+its own copy if desired.
 
 Supports custom headers (Authorization tokens, signing keys) so the
 receiver can verify the source.
+
+Not for chat-based agent runtimes (Claude Code, ChatGPT, Gemini chat)
+— those make outbound calls but don't accept inbound HTTP. Use
+``SubprocessNotifier`` or the ``spawn_evaluator`` flow instead.
 """
 from __future__ import annotations
 
