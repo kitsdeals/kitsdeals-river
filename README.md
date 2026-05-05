@@ -37,14 +37,13 @@ real-time, structured stream of approved deals built for agent consumers.
 | `RiverWatcher` — SSE + reconnect + cursor + filter + SIGHUP reload | ✓ |
 | `Profile` — Pydantic schema, YAML load/save, dedup helpers | ✓ |
 | `DecisionsLog` — JSONL append-only with size-based rotation | ✓ |
-| `Notifier` — protocol + `StdoutNotifier` + `TelegramNotifier` | ✓ |
-| `spawn_claude_evaluator` — agent-wake-up with structured prompt | ✓ |
+| `Notifier` — protocol + 6 built-ins (stdout, telegram, slack, discord, http_post, subprocess) | ✓ |
+| `spawn_evaluator` — agent-agnostic wake-up with structured prompt | ✓ |
 | `skills/onboarding.md` — agent-facing setup interview | ✓ |
 | `skills/update-profile.md` — agent-facing ongoing refinement | ✓ |
 | CLI (`setup`, `run`, `reload`, `status`, `profile show/update/validate`) | ✓ |
-| `slack`, `discord`, `http_post`, `subprocess` notifiers | ☐ PR 38 |
-| Server-side `GET /v1/quickstart` agent funnel | ☐ PR 38 |
-| Kit's watcher migrated to dual-emit (Telegram + Claude wake-up) | ☐ PR 38 |
+| Server-side `GET /v1/quickstart` agent funnel | ✓ |
+| `examples/kit_dual_emit.py` — reference dual-emit pattern (observability + agent action) | ✓ |
 
 ## Install
 

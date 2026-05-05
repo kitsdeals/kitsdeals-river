@@ -7,8 +7,21 @@ the conversation into a profile.yaml + a running watcher daemon.
 """
 
 from .decisions import DecisionsLog
-from .evaluator import EvaluatorDecision, build_prompt, spawn_claude_evaluator
-from .notify import Notifier, StdoutNotifier, TelegramNotifier
+from .evaluator import (
+    EvaluatorDecision,
+    build_prompt,
+    spawn_claude_evaluator,
+    spawn_evaluator,
+)
+from .notify import (
+    DiscordNotifier,
+    HttpPostNotifier,
+    Notifier,
+    SlackNotifier,
+    StdoutNotifier,
+    SubprocessNotifier,
+    TelegramNotifier,
+)
 from .profile import (
     Profile,
     ProfileMeta,
@@ -20,7 +33,7 @@ from .profile import (
 )
 from .watcher import RiverEvent, RiverWatcher, Cursor
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "RiverWatcher",
@@ -36,8 +49,13 @@ __all__ = [
     "DecisionsLog",
     "EvaluatorDecision",
     "build_prompt",
+    "spawn_evaluator",
     "spawn_claude_evaluator",
     "Notifier",
+    "DiscordNotifier",
+    "HttpPostNotifier",
+    "SlackNotifier",
     "StdoutNotifier",
+    "SubprocessNotifier",
     "TelegramNotifier",
 ]

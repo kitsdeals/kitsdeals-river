@@ -252,3 +252,112 @@ async def test_spawn_evaluator_passes_recent_decisions(tmp_path: Path):
     # The prompt (last arg after --task) should contain the prior decision
     task_arg = runner.calls[0][-1]
     assert "deal_old" in task_arg
+
+
+# ---- spawn_evaluator (PR 38: generalized — agent-agnostic) -----------------
+
+
+@pytest.mark.asyncio
+async def test_spawn_evaluator_with_string_command(tmp_path: Path):
+    from kitsdeals_river.evaluator import spawn_evaluator
+    log = DecisionsLog(tmp_path / "decisions.jsonl")
+    runner = _FakeRunner(stdout='{"decision":"notify","reason":"x"}')
+    p = _make_profile()
+    await spawn_evaluator(
+        profile=p,
+        event=_make_event(),
+        matched_watch=p.watches[0],
+        decisions_log=log,
+        command="my-custom-agent",
+        runner=runner,
+    )
+    # Custom command name preserved as argv[0]
+    assert runner.calls[0][0] == "my-custom-agent"
+    # Default prompt args appended
+    assert "--no-input" in runner.calls[0]
+    assert "--task" in runner.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_spawn_evaluator_with_list_command(tmp_path: Path):
+    from kitsdeals_river.evaluator import spawn_evaluator
+    log = DecisionsLog(tmp_path / "decisions.jsonl")
+    runner = _FakeRunner(stdout='{"decision":"skip","reason":"x"}')
+    p = _make_profile()
+    await spawn_evaluator(
+        profile=p,
+        event=_make_event(),
+        matched_watch=p.watches[0],
+        decisions_log=log,
+        command=["my-agent", "--quiet", "--no-color"],
+        runner=runner,
+    )
+    args = runner.calls[0]
+    # Fixed args appear before the prompt-passing args
+    assert args[0:3] == ["my-agent", "--quiet", "--no-color"]
+    assert "--task" in args
+
+
+@pytest.mark.asyncio
+async def test_spawn_evaluator_custom_prompt_args_substitutes(tmp_path: Path):
+    """Agents that take the prompt differently (stdin, -p, positional)
+    can override prompt_args; {prompt} is substituted at spawn time."""
+    from kitsdeals_river.evaluator import spawn_evaluator
+    log = DecisionsLog(tmp_path / "decisions.jsonl")
+    runner = _FakeRunner(stdout='{"decision":"defer","reason":"x"}')
+    p = _make_profile()
+    await spawn_evaluator(
+        profile=p,
+        event=_make_event(),
+        matched_watch=p.watches[0],
+        decisions_log=log,
+        command="myagent",
+        prompt_args=["run", "--input", "{prompt}"],
+        runner=runner,
+    )
+    args = runner.calls[0]
+    assert args[0] == "myagent"
+    assert args[1] == "run"
+    assert args[2] == "--input"
+    # The {prompt} token was replaced with the rendered prompt (long string)
+    assert args[3].startswith("You are evaluating a deal")
+    assert "--task" not in args  # default prompt_args NOT applied when override given
+
+
+@pytest.mark.asyncio
+async def test_spawn_claude_evaluator_back_compat(tmp_path: Path):
+    """The old name still works with the historical 'claude' default."""
+    log = DecisionsLog(tmp_path / "decisions.jsonl")
+    runner = _FakeRunner(stdout='{"decision":"notify","reason":"x","message":"hi"}')
+    p = _make_profile()
+    # Import via the public alias path
+    from kitsdeals_river import spawn_claude_evaluator
+    decision = await spawn_claude_evaluator(
+        profile=p,
+        event=_make_event(),
+        matched_watch=p.watches[0],
+        decisions_log=log,
+        runner=runner,
+    )
+    assert decision.decision == "notify"
+    assert runner.calls[0][0] == "claude"
+
+
+# ---- AgentConfig schema changes -------------------------------------------
+
+
+def test_agent_config_command_required():
+    """PR 38: removed the 'claude' default from AgentConfig.command. The
+    onboarding agent must set it explicitly to whatever CLI it runs as."""
+    from kitsdeals_river.profile import AgentConfig
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        AgentConfig()  # no command supplied
+
+
+def test_agent_config_command_accepts_string_or_list():
+    from kitsdeals_river.profile import AgentConfig
+    a = AgentConfig(command="claude")
+    assert a.command == "claude"
+    b = AgentConfig(command=["myagent", "--quiet"])
+    assert b.command == ["myagent", "--quiet"]

@@ -58,7 +58,41 @@ agent looks up canonical IDs at this step instead.
 
 Their answer is conceptual, not syntactic. Adjust based on the response.
 
-### 6. Apply via CLI
+### 6. Decide whether to enable the agent-evaluator step
+
+By default the watcher just notifies on every match. If the user wants
+**personalized evaluation per deal** (you, the agent, decide notify/skip/
+defer based on the user's profile + recent decisions), set the
+`agent` block:
+
+```json
+{
+  "agent": {
+    "command": "claude",
+    "timeout_seconds": 60
+  }
+}
+```
+
+**The `command` value is YOUR own invocation.** You're the agent that
+will be spawned per deal. If you're Claude Code → `"claude"`. If you're
+a different CLI agent → use that. If unsure, leave the `agent` block
+out entirely; the user gets simple notifications without the eval step,
+and they can ask you to enable it later.
+
+Some agents take the prompt differently. The default appends
+`--no-input --task <prompt>` after the command. Override via
+`prompt_args` with the literal token `{prompt}` substituted at spawn
+time:
+
+```json
+"agent": {
+  "command": "myagent",
+  "prompt_args": ["run", "--input", "{prompt}"]
+}
+```
+
+### 7. Apply via CLI
 
 Build the profile spec as a JSON object matching the
 `kitsdeals_river.profile.Profile` schema, then run:
@@ -104,7 +138,7 @@ The shape of the JSON spec:
 }
 ```
 
-### 7. Confirm running
+### 8. Confirm running
 
 After `run &`:
 

@@ -96,13 +96,24 @@ class NotifyConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    """Optional: spawn an agent on every match (PR 37 scope, defined here so
-    the schema is stable).
+    """Optional: spawn an agent on every match.
 
-    When unset, the watcher only notifies — no autonomous evaluator step.
+    When unset (the whole ``agent`` block is omitted from profile.yaml),
+    the watcher only notifies — no autonomous evaluator step.
+
+    ``command`` is **required** when the block is set: the agent that
+    runs onboarding KNOWS its own invocation, so the right value is
+    self-evident at setup time. Hardcoding a default ("claude") would
+    silently produce wrong behavior for users running other agent CLIs.
+    String for a bare command ("claude"); list when fixed args matter
+    ("['myagent', '--quiet']"). The watcher appends the prompt-passing
+    args (default ``--no-input --task <prompt>``) after whatever this
+    resolves to. Override via ``prompt_args`` if your agent expects the
+    prompt differently.
     """
 
-    command: str = "claude"
+    command: str | list[str]
+    prompt_args: list[str] | None = None
     timeout_seconds: int = 60
 
     model_config = ConfigDict(extra="forbid")

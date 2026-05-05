@@ -1,4 +1,10 @@
-"""Evaluator — wakes a Claude Code session per matched deal.
+"""Evaluator — wakes the user's agent per matched deal.
+
+Generic over which agent CLI runs the evaluation. The agent that ran the
+onboarding skill knows its own invocation shape and writes that into
+``profile.agent.command`` during setup; the watcher reads that command
+and spawns it per matched deal. Claude Code is one option; any CLI that
+accepts a ``--task <prompt>`` style flag (or compatible) works.
 
 The agent gets a structured prompt with everything it needs to make a
 personalized notify/skip/defer decision: identity (from profile), the
@@ -9,11 +15,8 @@ the watcher executes the action.
 
 This split — agent decides, watcher acts — keeps credentials on the
 watcher side, makes the agent's output testable in isolation, and means
-a swap of the underlying model (Claude → another agent) only requires
-the new model to honor the same JSON contract.
-
-PR 38 will publish the matching skill files (skills/onboarding.md,
-skills/update-profile.md) so a Claude Code session has docs to load.
+swapping the underlying agent (Claude Code → another CLI) only requires
+the new agent to honor the same JSON contract.
 """
 from __future__ import annotations
 
@@ -31,9 +34,9 @@ from .watcher import RiverEvent
 
 logger = logging.getLogger("kitsdeals_river.evaluator")
 
-# Agent timeout default. The Claude session needs to read the profile,
-# scan recent decisions, evaluate the deal, and emit JSON — typically
-# completes in <30s, but allow some headroom.
+# Default timeout. The agent session needs to read the profile, scan
+# recent decisions, evaluate the deal, and emit JSON — typically <30s,
+# but allow some headroom for cold-start.
 DEFAULT_TIMEOUT_SECONDS = 60
 
 
@@ -176,19 +179,26 @@ Output a single JSON object on stdout, with NO surrounding prose:
 """
 
 
-async def spawn_claude_evaluator(
+async def spawn_evaluator(
     *,
     profile: Profile,
     event: RiverEvent,
     matched_watch: Watch,
     decisions_log: DecisionsLog,
-    command: str = "claude",
+    command: str | list[str],
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-    extra_args: list[str] | None = None,
+    prompt_args: list[str] | None = None,
     recent_decisions_count: int = 50,
     runner: "ProcessRunner | None" = None,
 ) -> EvaluatorDecision:
-    """Spawn the agent, parse its JSON output, and return the decision.
+    """Spawn the user's agent, parse its JSON output, return the decision.
+
+    ``command`` is the agent CLI invocation. Pass a string for a simple
+    binary (``"claude"``) or a list when extra fixed args matter
+    (``["myagent", "--no-color", "--quiet"]``). The watcher appends the
+    prompt-passing args (default: ``["--no-input", "--task", <prompt>]``)
+    after whatever ``command`` resolves to. Override ``prompt_args`` for
+    agents that take the prompt differently (e.g., stdin, ``-p``).
 
     Caller is responsible for executing the action (sending the
     notification, marking the deal seen, etc.) based on the returned
@@ -206,10 +216,23 @@ async def spawn_claude_evaluator(
         recent_decisions=recent,
     )
 
-    args = [command]
-    if extra_args:
-        args.extend(extra_args)
-    args.extend(["--no-input", "--task", prompt])
+    if isinstance(command, str):
+        args = [command]
+    else:
+        args = list(command)
+
+    if prompt_args is None:
+        # Claude Code's default: --task <prompt>, --no-input keeps it from
+        # waiting for further input. Override prompt_args if your agent
+        # uses a different shape (e.g., positional, stdin, --prompt).
+        args.extend(["--no-input", "--task", prompt])
+    else:
+        # Substitute the literal token "{prompt}" in any arg with the
+        # rendered prompt so callers can express custom shapes like
+        # ["-p", "{prompt}"] or ["run", "--input", "{prompt}"].
+        substituted = [a.replace("{prompt}", prompt) if "{prompt}" in a else a
+                       for a in prompt_args]
+        args.extend(substituted)
 
     runner = runner or _SubprocessRunner()
     stdout, stderr, returncode = await runner.run(args, timeout_seconds=timeout_seconds)
@@ -224,6 +247,43 @@ async def spawn_claude_evaluator(
         raise RuntimeError(f"evaluator returncode={returncode}: {stderr.strip()[:200]}")
 
     return EvaluatorDecision.parse(stdout)
+
+
+# Back-compat alias. PR 36 / PR 37 shipped under this name; users may have
+# imported it. Forwards to spawn_evaluator with the historical default
+# command="claude" so existing code keeps working unchanged.
+async def spawn_claude_evaluator(
+    *,
+    profile: Profile,
+    event: RiverEvent,
+    matched_watch: Watch,
+    decisions_log: DecisionsLog,
+    command: str = "claude",
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    extra_args: list[str] | None = None,
+    recent_decisions_count: int = 50,
+    runner: "ProcessRunner | None" = None,
+) -> EvaluatorDecision:
+    """Deprecated alias for ``spawn_evaluator``. Defaults command="claude"
+    for back-compat with PR 36/37 callers; new callers should use
+    ``spawn_evaluator`` and pass ``command`` explicitly."""
+    if extra_args:
+        # Old API: extra_args injected before the prompt-passing args.
+        # Translate by prepending into the command list, since spawn_evaluator
+        # appends the prompt args after `command`.
+        cmd: str | list[str] = [command, *extra_args]
+    else:
+        cmd = command
+    return await spawn_evaluator(
+        profile=profile,
+        event=event,
+        matched_watch=matched_watch,
+        decisions_log=decisions_log,
+        command=cmd,
+        timeout_seconds=timeout_seconds,
+        recent_decisions_count=recent_decisions_count,
+        runner=runner,
+    )
 
 
 # ---------------------------------------------------------------------------
