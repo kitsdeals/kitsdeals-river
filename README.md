@@ -5,7 +5,7 @@ real-time, structured stream of approved deals built for agent consumers.
 
 > **The interaction model is agent-mediated.** You're not expected to edit
 > YAML by hand. You tell your Claude/Code agent something like *"set up
-> github.com/paraffinendeavors/kitsdeals-river for me — I'm looking for TVs
+> github.com/kitsdeals/kitsdeals-river for me — I'm looking for TVs
 > and a laptop refresh"*, and the agent runs the onboarding skill (PR 37) to
 > translate the conversation into a `~/.kitsdeals/profile.yaml` plus a
 > running watcher daemon. The CLI commands and library API exist so the

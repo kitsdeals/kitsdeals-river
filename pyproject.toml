@@ -36,8 +36,8 @@ dev = [
 [project.urls]
 Homepage = "https://kitsdeals.com"
 Documentation = "https://api.kitsdeals.com/v1/river/guide"
-Repository = "https://github.com/paraffinendeavors/kitsdeals-river"
-Issues = "https://github.com/paraffinendeavors/kitsdeals-river/issues"
+Repository = "https://github.com/kitsdeals/kitsdeals-river"
+Issues = "https://github.com/kitsdeals/kitsdeals-river/issues"
 
 [project.scripts]
 kitsdeals-river = "kitsdeals_river.cli:main"

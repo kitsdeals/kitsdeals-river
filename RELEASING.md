@@ -9,7 +9,7 @@ dealer/kitsdeals-river/  (source of truth, private)
         │  scripts/release-kitsdeals-river.sh <version>
         │  → git subtree split + force-push + tag
         ▼
-github.com/paraffinendeavors/kitsdeals-river  (public, release-only)
+github.com/kitsdeals/kitsdeals-river  (public, release-only)
         │
         │  Actions: tag push triggers build + publish
         ▼
@@ -35,7 +35,7 @@ receives tagged release commits — never PRs, never feature branches.
 
 ### 2. Public repo
 
-1. Create `paraffinendeavors/kitsdeals-river` on GitHub. Empty, no
+1. Create `kitsdeals/kitsdeals-river` on GitHub. Empty, no
    README — the first release-script run populates it.
 2. Add the PyPI token as a repo secret:
    - Repo → Settings → Secrets and variables → Actions
@@ -49,7 +49,7 @@ On whichever machine you run releases from (probably your laptop):
 
 ```bash
 cd /path/to/dealer
-git remote add public-river git@github.com:paraffinendeavors/kitsdeals-river.git
+git remote add public-river git@github.com:kitsdeals/kitsdeals-river.git
 ```
 
 (Or use the HTTPS URL if you prefer; SSH is recommended so you don't
@@ -120,7 +120,7 @@ What it does:
 The tag push triggers the public repo's `release.yml` Action, which
 builds the sdist + wheel and publishes to PyPI. Watch:
 
-- Public Actions tab: https://github.com/paraffinendeavors/kitsdeals-river/actions
+- Public Actions tab: https://github.com/kitsdeals/kitsdeals-river/actions
 - PyPI project page: https://pypi.org/project/kitsdeals-river/
 
 ### 4. Verify
