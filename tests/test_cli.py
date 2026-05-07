@@ -396,3 +396,135 @@ def test_sanitize_watch_label():
     # All non-alnum collapses to "default" rather than empty
     assert _sanitize_watch_label("///") == "default"
     assert _sanitize_watch_label("") == "default"
+
+
+# ============================================================
+# v0.4.1: rich notification formatter tests
+# ============================================================
+
+from kitsdeals_river.cli import (  # noqa: E402
+    format_deal_telegram_html,
+    format_deal_plain,
+)
+
+
+def _full_deal():
+    """A representative river-event payload (post PR 50). Most tests
+    drop fields to validate optional-handling."""
+    return {
+        "id": "deal_abc123",
+        "product_name": "Apple AirPods 4 Wireless Earbuds (Active Noise Cancellation)",
+        "brand": "Apple",
+        "sku": "MWWA3AM/A",
+        "product_url": "https://www.amazon.com/dp/B0DJTPGHMR",
+        "image_url": "https://m.media-amazon.com/images/...",
+        "category": "electronics",
+        "subcategory": "audio",
+        "product_type": "wireless earbuds",
+        "condition": "new",
+        "merchant_name": "Amazon",
+        "merchant_slug": "amazon",
+        "current_price_cents": 9900,
+        "original_price_cents": 12900,
+        "discount_pct": 23,
+        "currency": "USD",
+        "deal_quality": "lowest price seen this year",
+        "deal_score": 87.5,
+        "expires_at": "2099-01-01T00:00:00Z",  # far future so countdown is stable
+    }
+
+
+def test_telegram_html_includes_title_prices_merchant_url():
+    msg = format_deal_telegram_html(_full_deal())
+    assert "<b>" in msg and "AirPods 4" in msg
+    assert "$99.00" in msg and "$129.00" in msg
+    assert "23% off" in msg
+    assert "At Amazon" in msg
+    # 87.5 rounds to 88 with :.0f formatting
+    assert "score 88" in msg
+    assert "lowest price seen this year" in msg
+    # URL appears as an anchor for Telegram parsing
+    assert '<a href="https://www.amazon.com/dp/B0DJTPGHMR">' in msg
+
+
+def test_telegram_html_escapes_user_content():
+    """Title with HTML metacharacters must be escaped — defense in
+    depth even though server validates URL truth."""
+    deal = _full_deal()
+    deal["product_name"] = 'Acme "Extreme" Headphones <pwned>'
+    msg = format_deal_telegram_html(deal)
+    assert "&lt;pwned&gt;" in msg
+    assert "<pwned>" not in msg
+
+
+def test_telegram_html_handles_open_box_condition():
+    deal = _full_deal()
+    deal["condition"] = "open_box"
+    msg = format_deal_telegram_html(deal)
+    assert "open box" in msg
+
+
+def test_telegram_html_omits_condition_when_new():
+    """Don't bloat the meta line with 'new' since it's the default."""
+    deal = _full_deal()
+    deal["condition"] = "new"
+    msg = format_deal_telegram_html(deal)
+    assert "new" not in msg.lower().split("score")[0]  # not in meta line before "score"
+
+
+def test_telegram_html_handles_missing_optionals():
+    """Deal with only the required fields still produces a valid message."""
+    deal = {
+        "id": "x",
+        "product_name": "Thing",
+        "current_price_cents": 4999,
+    }
+    msg = format_deal_telegram_html(deal)
+    assert "Thing" in msg
+    assert "$49.99" in msg
+    # No URL, no merchant, no expiry — just doesn't crash
+
+
+def test_telegram_html_falls_back_to_brand_plus_type_for_title():
+    """No product_name → brand + product_type."""
+    deal = {"id": "x", "brand": "Sony", "product_type": "65 OLED TV"}
+    msg = format_deal_telegram_html(deal)
+    assert "Sony 65 OLED TV" in msg
+
+
+def test_telegram_html_coupon_surfaces_when_present():
+    deal = _full_deal()
+    deal["coupon_code"] = "SAVE10"
+    msg = format_deal_telegram_html(deal)
+    assert "SAVE10" in msg
+
+
+def test_telegram_html_expiry_countdown():
+    """Future expiry shows days remaining; past expiry omitted."""
+    from datetime import datetime, timedelta, timezone
+    deal = _full_deal()
+    # +5d 6h to avoid the off-by-one when timedelta-int conversion
+    # truncates partial days at the day boundary.
+    deal["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=5, hours=6)).isoformat()
+    msg = format_deal_telegram_html(deal)
+    assert "ends in 5 day" in msg
+
+    deal["expires_at"] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    msg = format_deal_telegram_html(deal)
+    assert "ends in" not in msg
+
+
+def test_plain_format_no_html_tags():
+    msg = format_deal_plain(_full_deal())
+    assert "<b>" not in msg
+    assert "<a" not in msg
+    # Pipe-joined inline; same fields just no markup
+    assert "AirPods 4" in msg
+    assert "$99.00" in msg
+    assert "Amazon" in msg
+    assert "https://www.amazon.com/dp/B0DJTPGHMR" in msg
+
+
+def test_plain_format_handles_missing_fields():
+    msg = format_deal_plain({"id": "x", "product_name": "Thing"})
+    assert "Thing" in msg

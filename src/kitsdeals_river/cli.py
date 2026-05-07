@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html as html_module
 import json
 import logging
 import os
 import signal
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -571,19 +573,21 @@ def _make_default_handler(profile: Profile, args: argparse.Namespace):
     else:
         notifier = StdoutNotifier()
 
+    # SDK v0.4.1: format the message based on which notifier we have.
+    # Telegram gets HTML with link unfurling; stdout gets a multi-line
+    # plain-text version (still useful for dev / debugging). The
+    # full-detail event payload from the server (PR 50 onward) has all
+    # the fields we need; previous versions wasted that detail on a
+    # one-line "<brand> <product_type> — $X (Y% off)" string.
+    is_telegram = isinstance(notifier, TelegramNotifier)
+    format_fn = format_deal_telegram_html if is_telegram else format_deal_plain
+
     async def handler(event):
         if not event.is_deal:
             return
         deal = event.data
         if profile.matches_owned(deal) or profile.matches_blacklist(deal):
             return
-        # SDK v0.4.0: find which watch this deal matches and apply its
-        # notify_threshold. When watches share a single SSE connection
-        # this is the only correct place to do it (the server doesn't
-        # know about thresholds). With per-watch SSE (multi-watch
-        # mode) the deal will only arrive on the matching watch's
-        # connection anyway — but we still need to re-check here
-        # because both modes route through the same handler factory.
         watch = _watch_for_deal(profile, deal)
         if watch is None:
             # Defensive: server delivered an event our local view of
@@ -600,13 +604,157 @@ def _make_default_handler(profile: Profile, args: argparse.Namespace):
                 watch.label,
             )
             return
-        brand = deal.get("brand", "?")
-        ptype = deal.get("product_type", "")
-        price = deal.get("current_price_cents", 0) / 100
-        msg = f"{brand} {ptype} — ${price:.2f} ({deal.get('discount_pct', 0)}% off)"
+        msg = format_fn(deal)
         await notifier.send(msg, deal)
 
     return handler
+
+
+# ---------------------------------------------------------------------------
+# Notification formatters (SDK v0.4.1)
+# ---------------------------------------------------------------------------
+# The river/webhook event payload includes the full deal record (since
+# server PR 50). The default handler should use it — earlier SDK
+# versions emitted a single-line "<brand> <product_type> — $X" message
+# which threw away the URL, merchant name, deal_quality verdict, and
+# expiry countdown. Kit's audit flagged the resulting notifications as
+# "missing the link" — fixed here.
+
+def _format_price(cents: int | None) -> str | None:
+    if cents is None:
+        return None
+    return f"${cents / 100:,.2f}"
+
+
+def _days_until(iso: str | None) -> int | None:
+    if not iso:
+        return None
+    try:
+        when = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    delta = when - datetime.now(timezone.utc)
+    return delta.days if delta.total_seconds() > 0 else None
+
+
+def _deal_title(deal: dict) -> str:
+    """Best-available title. Prefer product_name, fall back to brand+type."""
+    pn = deal.get("product_name")
+    if isinstance(pn, str) and pn.strip():
+        return pn.strip()
+    brand = deal.get("brand") or ""
+    ptype = deal.get("product_type") or ""
+    return f"{brand} {ptype}".strip() or "(unnamed deal)"
+
+
+def format_deal_telegram_html(deal: dict) -> str:
+    """Build a rich Telegram-HTML notification for a deal event.
+
+    Telegram unfurls the first URL into a card (image + title + site),
+    so the product_url goes near the top of the body. HTML tags are
+    escaped on user-supplied content so a malicious title can't inject
+    markup (defense in depth — the server already validates URL truth).
+    """
+    title = html_module.escape(_deal_title(deal))
+    lines: list[str] = [f"🔥 <b>{title}</b>"]
+
+    # Pricing line: "$99 (was $129) — 23% off"
+    current = _format_price(deal.get("current_price_cents"))
+    original = _format_price(deal.get("original_price_cents"))
+    discount = deal.get("discount_pct")
+    if current:
+        price_line = current
+        if original and original != current:
+            price_line += f" (was {original})"
+        if isinstance(discount, (int, float)) and discount > 0:
+            price_line += f" — <b>{discount:.0f}% off</b>"
+        lines.append(price_line)
+
+    # Meta line: "At Best Buy · open box · score 87"
+    meta_parts: list[str] = []
+    merchant = deal.get("merchant_name") or deal.get("merchant_slug")
+    if merchant:
+        meta_parts.append(f"At {html_module.escape(str(merchant))}")
+    cond = deal.get("condition")
+    if cond and cond != "new":
+        meta_parts.append(html_module.escape(str(cond).replace("_", " ")))
+    score = deal.get("deal_score")
+    if isinstance(score, (int, float)):
+        meta_parts.append(f"score {score:.0f}")
+    if meta_parts:
+        lines.append(" · ".join(meta_parts))
+
+    # Optional quality verdict (italic). e.g. "lowest price seen this year"
+    quality = deal.get("deal_quality")
+    if isinstance(quality, str) and quality.strip():
+        lines.append(f"<i>{html_module.escape(quality.strip())}</i>")
+
+    # Coupon code if present
+    coupon = deal.get("coupon_code")
+    if coupon:
+        lines.append(f"Coupon: <code>{html_module.escape(str(coupon))}</code>")
+
+    # The product URL itself — Telegram unfurls into a card. Plain
+    # link, no clickbait surrounding text; the card carries the visual.
+    url = deal.get("product_url")
+    if url:
+        safe_url = html_module.escape(str(url), quote=True)
+        lines.append(f'🔗 <a href="{safe_url}">{safe_url}</a>')
+
+    # Expiry countdown
+    days = _days_until(deal.get("expires_at"))
+    if days is not None:
+        lines.append(f"ends in {days} day{'s' if days != 1 else ''}")
+
+    return "\n".join(lines)
+
+
+def format_deal_plain(deal: dict) -> str:
+    """Plain-text version of format_deal_telegram_html for stdout / non-
+    HTML notifiers. Same fields, no markup."""
+    lines = [_deal_title(deal)]
+
+    current = _format_price(deal.get("current_price_cents"))
+    original = _format_price(deal.get("original_price_cents"))
+    discount = deal.get("discount_pct")
+    if current:
+        price_line = current
+        if original and original != current:
+            price_line += f" (was {original})"
+        if isinstance(discount, (int, float)) and discount > 0:
+            price_line += f" — {discount:.0f}% off"
+        lines.append(price_line)
+
+    meta_parts: list[str] = []
+    merchant = deal.get("merchant_name") or deal.get("merchant_slug")
+    if merchant:
+        meta_parts.append(f"At {merchant}")
+    cond = deal.get("condition")
+    if cond and cond != "new":
+        meta_parts.append(str(cond).replace("_", " "))
+    score = deal.get("deal_score")
+    if isinstance(score, (int, float)):
+        meta_parts.append(f"score {score:.0f}")
+    if meta_parts:
+        lines.append(" · ".join(meta_parts))
+
+    quality = deal.get("deal_quality")
+    if isinstance(quality, str) and quality.strip():
+        lines.append(quality.strip())
+
+    coupon = deal.get("coupon_code")
+    if coupon:
+        lines.append(f"Coupon: {coupon}")
+
+    url = deal.get("product_url")
+    if url:
+        lines.append(str(url))
+
+    days = _days_until(deal.get("expires_at"))
+    if days is not None:
+        lines.append(f"ends in {days} day{'s' if days != 1 else ''}")
+
+    return " | ".join(lines)
 
 
 # ---------------------------------------------------------------------------

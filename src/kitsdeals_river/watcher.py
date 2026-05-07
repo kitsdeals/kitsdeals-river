@@ -229,7 +229,17 @@ class RiverWatcher:
         while not self._stop.is_set():
             self._maybe_apply_reload()
             try:
-                await self._catch_up_via_rest()
+                # SDK v0.4.1: dropped automatic _catch_up_via_rest from
+                # the reconnect loop. The river is "live, push, best-
+                # effort" — bridging transient disconnects via REST hit
+                # the API on every blip, didn't filter cleanly with
+                # river-vocabulary filters, and crossed the bulk-listing
+                # paywall when limit>10. Users who need guaranteed
+                # delivery during downtime should use webhooks (which
+                # retry server-side until the callback responds 2xx),
+                # not the river. Initial backfill (--initial-backfill)
+                # remains as the explicit one-shot for "show me what's
+                # currently live when I first set up this watch."
                 await self._consume_sse()
                 # Clean disconnect (server closed) — reset backoff
                 backoff = RECONNECT_INITIAL_BACKOFF_SECONDS
@@ -337,29 +347,39 @@ class RiverWatcher:
             self.cursor.save(last_event_id=last_id, last_occurred_at=last_at)
 
     async def _do_initial_backfill(self) -> None:
-        """One-shot REST backfill at first start.
+        """One-shot REST backfill at first start (cursor empty).
 
-        Fetches recent-window deals matching the watch's coarse server-
-        side filters (category / max_price / min_discount — the ones
-        /v1/deals supports today) and dispatches each through the same
-        handler that processes live SSE events. The handler's downstream
-        personalization filters (matches_owned, matches_blacklist, etc.)
-        still apply, so this is "show me what's already on the river"
-        not "bypass my filters."
+        Two-phase to handle the impedance mismatch between /v1/deals (which
+        returns summary-tier without product_name and supports only a coarse
+        filter vocabulary) and the river's full filter vocabulary
+        (brand_in / condition_in / product_name_contains, etc.):
 
-        Runs only when the cursor is empty (fresh first start). Sets the
-        cursor to the most-recent deal seen so SSE doesn't re-deliver
-        the same events.
+          1. Coarse list call against /v1/deals?limit=10&since=<window>&
+             category=&max_price=&min_discount= — gets candidate ids.
+          2. Per-candidate hydration via GET /v1/deals/:id — full detail
+             including product_name, brand, condition. Free since PR 48.
+
+        Then each hydrated deal is dispatched through the normal handler
+        chain, which applies the downstream filter (the same one the live
+        SSE path uses) — so product_name_contains, brand_in, condition_in
+        all match correctly during backfill, not just at live SSE time.
+
+        Closes Kit's v0.4.0 audit gap: the AirPods 4 deal was missed during
+        backfill because the summary-tier list lacked product_name, so
+        _watch_for_deal couldn't apply product_name_contains. With per-deal
+        hydration the filter sees the full record.
         """
         if self.cursor.load().get("last_occurred_at"):
-            # Not a fresh start — defer to the normal _catch_up_via_rest
-            # path which uses since=<cursor>.
+            # Not a fresh start — skip backfill. v0.4.1 dropped the
+            # reconnect-time _catch_up_via_rest, so subsequent process
+            # starts (e.g. after a reboot) just resume live SSE. Users
+            # who need reboot recovery should use webhooks instead;
+            # the river is live-only by design.
             return
 
-        # Build coarse filter from the watch. /v1/deals supports a
-        # smaller vocabulary than /v1/river — just the overlapping
-        # subset is used here. The downstream handler does the rest
-        # (brand_in, condition_in, product_name_contains).
+        # Phase 1: coarse list. /v1/deals supports a smaller filter
+        # vocabulary than /v1/river — pass only what overlaps. The
+        # full filter chain runs in phase 2 against hydrated detail.
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=self._initial_backfill_window_days)
         ).isoformat()
@@ -376,26 +396,46 @@ class RiverWatcher:
                     else str(self.filter.min_discount_pct)
                 )
 
-        url = f"{self.api_base}/v1/deals"
+        list_url = f"{self.api_base}/v1/deals"
         async with self._make_client() as client:
             try:
-                response = await client.get(url, params=params)
+                response = await client.get(list_url, params=params)
                 response.raise_for_status()
                 payload = response.json()
             except httpx.HTTPError as e:
-                logger.warning("initial backfill GET failed: %s; skipping", e)
+                logger.warning("initial backfill list GET failed: %s; skipping", e)
                 return
 
-        deals = payload.get("data", {}).get("deals") or []
-        logger.info(
-            "initial backfill: %d deal(s) within %dd window",
-            len(deals),
-            self._initial_backfill_window_days,
-        )
+            summary_rows = payload.get("data", {}).get("deals") or []
+            logger.info(
+                "initial backfill: %d candidate(s) within %dd window; hydrating detail",
+                len(summary_rows),
+                self._initial_backfill_window_days,
+            )
+
+            # Phase 2: hydrate per-deal detail so the downstream filter
+            # has product_name / brand / condition to match against.
+            hydrated: list[dict] = []
+            for row in summary_rows:
+                deal_id = row.get("id")
+                if not deal_id:
+                    continue
+                try:
+                    detail_resp = await client.get(f"{list_url}/{deal_id}")
+                    detail_resp.raise_for_status()
+                    detail_payload = detail_resp.json()
+                except httpx.HTTPError as e:
+                    # Single-deal hydration failure shouldn't kill the
+                    # whole backfill — log and skip this one.
+                    logger.warning("backfill hydrate %s failed: %s", deal_id, e)
+                    continue
+                full_deal = detail_payload.get("data") or {}
+                if full_deal:
+                    hydrated.append(full_deal)
 
         last_id = ""
         last_at = ""
-        for deal in sorted(deals, key=lambda d: d.get("published_at") or ""):
+        for deal in sorted(hydrated, key=lambda d: d.get("published_at") or ""):
             envelope = {
                 "schema_version": 1,
                 "event_type": "deal",
@@ -407,42 +447,84 @@ class RiverWatcher:
             await self._dispatch(event)
             last_id = event.event_id
             last_at = event.occurred_at
-        if deals:
+        if hydrated:
             # Set cursor so SSE doesn't replay these events on connect.
-            # Subsequent ticks will use the normal _catch_up_via_rest.
             self.cursor.save(last_event_id=last_id, last_occurred_at=last_at)
 
     async def _consume_sse(self) -> None:
         """Open and drain a single SSE connection. Returns when the server
-        closes; the run loop reconnects."""
-        url = f"{self.api_base}/v1/river"
-        params = self.filter.to_query_params() if self.filter else {}
-        state = self.cursor.load()
-        headers: dict[str, str] = {}
-        if state.get("last_event_id"):
-            # Native EventSource resume hint. The server's current /v1/river
-            # implementation doesn't act on this header (it's live-only) but
-            # passing it costs nothing and forward-compats with any future
-            # server-side replay buffer.
-            headers["Last-Event-ID"] = state["last_event_id"]
+        closes, when reload is requested, OR when self._stop fires.
 
-        async with self._make_client() as client:
-            async with client.stream("GET", url, params=params, headers=headers) as response:
-                response.raise_for_status()
-                async for envelope, event_id in _parse_sse(response):
-                    event = RiverEvent.from_envelope(envelope)
-                    await self._dispatch(event)
-                    if event.event_id and event.occurred_at:
-                        self.cursor.save(
-                            last_event_id=event.event_id,
-                            last_occurred_at=event.occurred_at,
-                        )
-                    # PR 37: between-events check for stop / reload. Tearing
-                    # the connection here is the cleanest way to apply a new
-                    # filter — the loop reconnects with the updated query
-                    # params on the next iteration.
-                    if self._stop.is_set() or self._reload_requested.is_set():
-                        return
+        SDK v0.4.1: the previous version only checked self._stop between
+        events. If no events arrived during shutdown (the common case for
+        a quiet watch), `systemctl stop` would hang ~90s until SIGKILL.
+        Fix: race the SSE consumption against self._stop.wait() so a stop
+        signal cancels the task mid-read and the httpx context manager
+        closes the connection cleanly. Reload still uses the
+        between-events check (it's not as urgent — agent-driven reloads
+        are not on a timeout).
+        """
+        async def _inner() -> None:
+            url = f"{self.api_base}/v1/river"
+            params = self.filter.to_query_params() if self.filter else {}
+            state = self.cursor.load()
+            headers: dict[str, str] = {}
+            if state.get("last_event_id"):
+                # Native EventSource resume hint. The server's current /v1/river
+                # implementation doesn't act on this header (it's live-only) but
+                # passing it costs nothing and forward-compats with any future
+                # server-side replay buffer.
+                headers["Last-Event-ID"] = state["last_event_id"]
+
+            async with self._make_client() as client:
+                async with client.stream("GET", url, params=params, headers=headers) as response:
+                    response.raise_for_status()
+                    async for envelope, event_id in _parse_sse(response):
+                        event = RiverEvent.from_envelope(envelope)
+                        await self._dispatch(event)
+                        if event.event_id and event.occurred_at:
+                            self.cursor.save(
+                                last_event_id=event.event_id,
+                                last_occurred_at=event.occurred_at,
+                            )
+                        # PR 37: between-events check for reload. Tearing
+                        # the connection here is the cleanest way to apply
+                        # a new filter — the loop reconnects with the
+                        # updated query params on the next iteration.
+                        # _stop is handled at task-level via cancellation
+                        # in the outer race below — that exits even when
+                        # no events are arriving.
+                        if self._reload_requested.is_set():
+                            return
+
+        sse_task = asyncio.create_task(_inner())
+        stop_task = asyncio.create_task(self._stop.wait())
+        try:
+            await asyncio.wait(
+                {sse_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if self._stop.is_set():
+                # Stop fired while SSE was still reading — cancel it
+                # so the httpx stream context manager closes the
+                # underlying connection.
+                sse_task.cancel()
+                try:
+                    await sse_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            else:
+                # SSE returned normally (server closed or reload). Let
+                # any exception it raised propagate to the run loop's
+                # reconnect-on-error handler.
+                await sse_task
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
+                try:
+                    await stop_task
+                except asyncio.CancelledError:
+                    pass
 
     async def _dispatch(self, event: RiverEvent) -> None:
         if self._on_event is None:

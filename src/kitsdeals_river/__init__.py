@@ -33,7 +33,7 @@ from .profile import (
 )
 from .watcher import RiverEvent, RiverWatcher, Cursor
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "RiverWatcher",

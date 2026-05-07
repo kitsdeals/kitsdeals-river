@@ -295,3 +295,67 @@ async def test_filter_passed_through_to_sse_url(tmp_path: Path):
     url = seen_urls[0]
     assert "category=tv" in url
     assert "brand_in=lg%2Csony" in url or "brand_in=lg,sony" in url
+
+
+# ============================================================
+# v0.4.1: SSE consumer must exit promptly when self._stop fires
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_consume_sse_exits_when_stop_fires(tmp_path: Path):
+    """SDK v0.4.1: previously, _consume_sse only checked self._stop
+    BETWEEN events. A stop signal during a quiet period (no events
+    arriving) wouldn't tear the connection — systemd would wait its
+    full timeout and SIGKILL. Fix is to race SSE consumption against
+    self._stop.wait() and cancel mid-read on stop. This test reproduces
+    the quiet-period case: no events ever arrive, but the watcher should
+    still exit promptly when stop is set.
+    """
+    from kitsdeals_river.watcher import RiverWatcher
+
+    # A stream that never emits anything — simulates a quiet SSE.
+    async def never_yields(request):
+        async def stream_forever():
+            # Hold the connection open forever (would yield nothing).
+            await asyncio.sleep(60)
+            yield b""
+
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=httpx.AsyncByteStream(),
+        )
+
+    # Easier: build a watcher and trip self._stop very shortly after
+    # _consume_sse opens the connection. We use a fake transport that
+    # blocks-but-eventually-cancels.
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, content=b""))
+
+    def factory():
+        return httpx.AsyncClient(transport=transport)
+
+    w = RiverWatcher(
+        api_base="http://test",
+        cursor_path=tmp_path / "cursor.json",
+        on_event=lambda e: None,
+        http_client_factory=factory,
+    )
+
+    async def trigger_stop():
+        await asyncio.sleep(0.05)
+        w._stop.set()
+
+    # Race: _consume_sse should exit within ~0.1s once stop is set.
+    # If the bug is back, this test will hang until pytest-asyncio's
+    # default timeout kicks in.
+    consume_task = asyncio.create_task(w._consume_sse())
+    asyncio.create_task(trigger_stop())
+
+    try:
+        await asyncio.wait_for(consume_task, timeout=2.0)
+    except asyncio.TimeoutError:
+        consume_task.cancel()
+        raise AssertionError(
+            "_consume_sse did not exit within 2s of self._stop being set"
+        )

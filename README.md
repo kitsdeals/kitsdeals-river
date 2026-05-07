@@ -118,6 +118,30 @@ against the server's deal-quality score (`deal_score`, 0–100):
 Deals lacking `deal_score` only notify when `notify_threshold` is
 `anything` — refuse-to-guess posture.
 
+## Telegram delivery setup
+
+The default notifier reads `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
+from the environment. Two prerequisites:
+
+1. **Create a bot** via Telegram's `@BotFather`: send `/newbot`, pick a
+   display name and username, save the token BotFather replies with.
+2. **The user must DM the bot first.** Telegram bots cannot send the
+   first message — the user has to open a chat with their new bot and
+   send `/start` (or any message). Skip this step and the watcher runs
+   fine but `sendMessage` returns
+   `Forbidden: bot can't initiate conversation with a user`.
+
+Then retrieve the chat_id (`GET https://api.telegram.org/bot<TOKEN>/getUpdates`
+returns `result[*].message.chat.id`) and put both values in the
+environment file your service reads. For full step-by-step including
+verification and forum-topic routing, see `skills/onboarding.md` — the
+agent-facing version walks through every failure mode.
+
+The default notification format includes brand, product name, current
++ original price, discount %, merchant, condition, deal score, optional
+quality verdict, the product URL (Telegram unfurls into a card), and an
+expiry countdown when known.
+
 ## Minimal example (without an agent in the loop)
 
 ```python

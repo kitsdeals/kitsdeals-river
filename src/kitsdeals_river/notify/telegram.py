@@ -46,7 +46,12 @@ class TelegramNotifier:
             "chat_id": self._chat_id,
             "text": message,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True,
+            # SDK v0.4.1: enable Telegram's link preview so the deal's
+            # product_url unfurls into a card (image + title + site).
+            # That's what makes the notification feel "complete" instead
+            # of a tiny one-liner. Telegram unfurls the FIRST URL in the
+            # message; the formatter puts product_url near the top.
+            "disable_web_page_preview": False,
         }
         if self._topic_id:
             try:

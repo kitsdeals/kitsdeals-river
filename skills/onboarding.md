@@ -162,11 +162,147 @@ get a notification the next time a deal matches.
   OLED"*, store that as `product_name`. If you guess `prod_lg_c4_65` and
   it doesn't match anything in the river events, dedup silently fails.
 
+## Setting up Telegram delivery (the from-scratch case)
+
+If the user already has a Telegram bot they use for personal automation
+and just needs to plug in the token + chat id, skip this section.
+
+If the user is starting from zero, walk them through this — there are
+five steps and one critical gotcha. **You should drive the steps for
+them; don't just hand them a list and disappear.** Ask for the outputs
+of each step inline so you can detect mistakes early.
+
+### Step 1 — Create the bot via BotFather
+
+Tell the user to open Telegram (mobile or desktop), search for
+`@BotFather` (the official Telegram bot for managing bots — the
+verified one with a blue checkmark), open a chat with it, and send:
+
+```
+/newbot
+```
+
+BotFather will prompt for:
+- A **display name** for the bot (any string, e.g. "Tom's Deals")
+- A **username** ending in `bot` (must be globally unique, e.g.
+  `toms_deals_v1_bot`)
+
+When successful, BotFather replies with a token that looks like:
+
+```
+1234567890:AAH9Xq...rest-of-token
+```
+
+**Ask the user to paste that token to you.** Treat it as a secret —
+don't echo it back in plain text in subsequent messages, don't log it.
+
+### Step 2 — CRITICAL: the user must DM `/start` to their new bot
+
+This is the most-skipped step and the failure mode is silent. Telegram
+bots **cannot send the first message** to a user — the user has to
+initiate the conversation. If you skip this, the watcher will start
+fine, the `kitsdeals-river status` check will say `running: true`, no
+notification will ever arrive, and the only signal in the logs is a
+single line:
+
+```
+{"description": "Forbidden: bot can't initiate conversation with a user"}
+```
+
+So: tell the user to open Telegram, search for the username they just
+made (e.g. `@toms_deals_v1_bot`), open the chat, and either tap the
+"Start" button or send `/start` as a message. **Wait for them to
+confirm they did this.** Don't proceed until they do.
+
+### Step 3 — Get the chat_id
+
+The chat_id is a numeric Telegram identifier for the conversation the
+bot will deliver to. Two paths to retrieve it; pick whichever fits the
+user's setup:
+
+**Path A (fastest, agent-driven)**: have the user send any message to
+the bot (e.g. "hello"). Then make this call yourself, substituting the
+token they gave you in step 1:
+
+```
+GET https://api.telegram.org/bot<TOKEN>/getUpdates
+```
+
+The response is JSON. Find `result[*].message.chat.id` — that's the
+number you want, e.g. `123456789`. Direct chats are positive integers;
+group chats are large negative integers (we'll skip groups in v1 —
+direct chat is enough for most setups).
+
+**Path B (user-driven)**: if you can't make outbound HTTP calls from
+your runtime, tell the user to open Telegram and DM `@userinfobot` —
+it replies with their numeric user id, which IS their direct chat_id
+with any bot.
+
+Either way, **read back the chat_id to the user** so they can sanity-
+check ("That's a 9-digit number starting with 12 — does that look
+right?"). Wrong chat_id is the second-most-common Telegram setup
+failure.
+
+### Step 4 — Set the env vars
+
+The default profile expects two env-var names: `TELEGRAM_BOT_TOKEN`
+and `TELEGRAM_CHAT_ID`. Set them so the watcher process can read them.
+For systemd, this typically means an EnvironmentFile with mode 0600:
+
+```ini
+# /etc/systemd/system/kitsdeals.service
+[Service]
+EnvironmentFile=/home/<user>/.config/kitsdeals-river/telegram.env
+ExecStart=/path/to/kitsdeals-river run
+```
+
+```bash
+# /home/<user>/.config/kitsdeals-river/telegram.env
+TELEGRAM_BOT_TOKEN=1234567890:AAH9Xq...
+TELEGRAM_CHAT_ID=123456789
+```
+
+Permissions: `chmod 600` the env file. The token is a secret.
+
+### Step 5 — Verify before declaring done
+
+Don't trust `kitsdeals-river status` as a verification of delivery —
+it reports the watcher's own health, not whether Telegram is reachable.
+Send a one-shot test by hitting Telegram's API directly:
+
+```
+POST https://api.telegram.org/bot<TOKEN>/sendMessage
+{"chat_id": <CHAT_ID>, "text": "kitsdeals-river setup test"}
+```
+
+The response should include `"ok": true`. If it returns
+`"description": "Forbidden: bot can't initiate conversation with a
+user"`, step 2 wasn't done — go back and have the user send `/start`
+to the bot. If it returns `"description": "Bad Request: chat not
+found"`, step 3's chat_id is wrong — try Path B from step 3 to get
+the right one.
+
+Once the test message lands in the user's Telegram, you're done.
+
+### Forum-topic delivery (optional, advanced)
+
+If the user wants notifications routed to a specific topic in a
+Telegram supergroup (vs. their direct chat), they need to:
+1. Create the supergroup with topics enabled
+2. Add the bot to the group
+3. Get the topic_id (visible in the URL when you tap into a topic)
+4. Set `TELEGRAM_TOPIC_ID=<id>` as an additional env var
+5. In the profile, set `notify.telegram.topic_id_env: "TELEGRAM_TOPIC_ID"`
+
+This is rare for v1 setups (most users want direct chat). Skip unless
+the user specifically asks for group/topic routing.
+
 ## Common adaptations
 
-- **User has no Telegram bot yet:** walk them through `@BotFather` → new
-  bot → token. Or fall back to `channel: stdout` for now and tell them
-  they can rerun setup later when they have credentials.
+- **User has no Telegram bot yet:** see "Setting up Telegram delivery
+  (the from-scratch case)" above. If they don't want to set up a bot
+  at all (e.g., privacy-conscious), fall back to `channel: stdout` and
+  tell them they can rerun setup later when they have credentials.
 - **User declines `notify_threshold` question:** default to `clear_win`.
   They can loosen later via `update-profile`.
 - **User asks for things outside our taxonomy** (e.g., real estate
