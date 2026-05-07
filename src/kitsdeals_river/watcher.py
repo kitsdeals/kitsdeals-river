@@ -22,7 +22,7 @@ import json
 import logging
 import signal
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -142,6 +142,19 @@ class RiverWatcher:
         # closure, but anything that returns a WatchFilter (or None to
         # clear filtering) works.
         reload_profile: Callable[[], WatchFilter | None] | None = None,
+        # SDK v0.4.0: when True, on first start (cursor empty) the
+        # watcher does a one-shot REST query against /v1/deals matching
+        # the watch's coarse filters (category / max_price /
+        # min_discount) and dispatches each currently-live deal through
+        # the same handler as live SSE. Closes the gap Kit's audit
+        # flagged: a freshly-configured watch otherwise misses every
+        # currently-live matching deal. The handler still applies the
+        # downstream personalization filters (matches_owned,
+        # suppress.keywords_blacklist, etc.) so this is a "show me
+        # what's already on the river right now" feature, not a
+        # filter-bypass.
+        initial_backfill: bool = False,
+        initial_backfill_window_days: int = 14,
         # Test/extension hooks: each is parameterized so unit tests can
         # inject mocks without monkeypatching globals.
         http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
@@ -153,6 +166,9 @@ class RiverWatcher:
         self.user_agent = user_agent
         self._on_event: Handler | None = on_event
         self._reload_profile = reload_profile
+        self._initial_backfill = initial_backfill
+        self._initial_backfill_window_days = initial_backfill_window_days
+        self._initial_backfill_done = False
         self._http_client_factory = http_client_factory
         self._sleep = sleep
         self._stop = asyncio.Event()
@@ -199,6 +215,17 @@ class RiverWatcher:
     async def run_async(self) -> None:
         """Same loop for callers that already manage the event loop."""
         backoff = RECONNECT_INITIAL_BACKOFF_SECONDS
+        # SDK v0.4.0: optional initial backfill. Runs ONCE when the cursor
+        # is empty (i.e., first start of this watch) — surfaces currently-
+        # live matching deals through the handler before we open SSE. Skip
+        # silently when disabled or when there's already a cursor (i.e.
+        # this isn't a fresh start).
+        if self._initial_backfill and not self._initial_backfill_done:
+            try:
+                await self._do_initial_backfill()
+            except Exception as e:  # noqa: BLE001 - defensive, don't kill the watcher
+                logger.warning("initial backfill failed: %s; continuing to live SSE", e)
+            self._initial_backfill_done = True
         while not self._stop.is_set():
             self._maybe_apply_reload()
             try:
@@ -307,6 +334,82 @@ class RiverWatcher:
             last_id = event.event_id
             last_at = event.occurred_at
         if deals:
+            self.cursor.save(last_event_id=last_id, last_occurred_at=last_at)
+
+    async def _do_initial_backfill(self) -> None:
+        """One-shot REST backfill at first start.
+
+        Fetches recent-window deals matching the watch's coarse server-
+        side filters (category / max_price / min_discount — the ones
+        /v1/deals supports today) and dispatches each through the same
+        handler that processes live SSE events. The handler's downstream
+        personalization filters (matches_owned, matches_blacklist, etc.)
+        still apply, so this is "show me what's already on the river"
+        not "bypass my filters."
+
+        Runs only when the cursor is empty (fresh first start). Sets the
+        cursor to the most-recent deal seen so SSE doesn't re-deliver
+        the same events.
+        """
+        if self.cursor.load().get("last_occurred_at"):
+            # Not a fresh start — defer to the normal _catch_up_via_rest
+            # path which uses since=<cursor>.
+            return
+
+        # Build coarse filter from the watch. /v1/deals supports a
+        # smaller vocabulary than /v1/river — just the overlapping
+        # subset is used here. The downstream handler does the rest
+        # (brand_in, condition_in, product_name_contains).
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=self._initial_backfill_window_days)
+        ).isoformat()
+        params: dict[str, str] = {"since": cutoff, "limit": "10"}
+        if self.filter:
+            if self.filter.category:
+                params["category"] = self.filter.category
+            if self.filter.max_price_cents is not None:
+                params["max_price"] = str(self.filter.max_price_cents)
+            if self.filter.min_discount_pct is not None:
+                params["min_discount"] = (
+                    str(int(self.filter.min_discount_pct))
+                    if float(self.filter.min_discount_pct).is_integer()
+                    else str(self.filter.min_discount_pct)
+                )
+
+        url = f"{self.api_base}/v1/deals"
+        async with self._make_client() as client:
+            try:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                payload = response.json()
+            except httpx.HTTPError as e:
+                logger.warning("initial backfill GET failed: %s; skipping", e)
+                return
+
+        deals = payload.get("data", {}).get("deals") or []
+        logger.info(
+            "initial backfill: %d deal(s) within %dd window",
+            len(deals),
+            self._initial_backfill_window_days,
+        )
+
+        last_id = ""
+        last_at = ""
+        for deal in sorted(deals, key=lambda d: d.get("published_at") or ""):
+            envelope = {
+                "schema_version": 1,
+                "event_type": "deal",
+                "event_id": deal.get("id", ""),
+                "occurred_at": deal.get("published_at", ""),
+                "data": deal,
+            }
+            event = RiverEvent.from_envelope(envelope)
+            await self._dispatch(event)
+            last_id = event.event_id
+            last_at = event.occurred_at
+        if deals:
+            # Set cursor so SSE doesn't replay these events on connect.
+            # Subsequent ticks will use the normal _catch_up_via_rest.
             self.cursor.save(last_event_id=last_id, last_occurred_at=last_at)
 
     async def _consume_sse(self) -> None:

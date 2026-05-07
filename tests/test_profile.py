@@ -75,6 +75,60 @@ def test_filter_to_query_params():
     assert params["min_discount_pct"] == "25"
 
 
+# v0.4.0: product_name_contains is the canonical filter for "narrow inside
+# a brand without false positives" (the AirPods 4 vs AirPods Pro case Kit's
+# audit flagged). Server-side this lands as PR 52; SDK schema previously
+# rejected the field due to extra="forbid".
+def test_filter_accepts_product_name_contains():
+    f = WatchFilter(brand_in=["Apple"], product_name_contains="AirPods 4")
+    assert f.product_name_contains == "AirPods 4"
+
+
+def test_filter_to_query_params_emits_product_name_contains():
+    f = WatchFilter(brand_in=["Apple"], product_name_contains="AirPods 4")
+    params = f.to_query_params()
+    assert params["brand_in"] == "apple"
+    assert params["product_name_contains"] == "AirPods 4"
+
+
+def test_filter_strips_empty_product_name_contains():
+    """Whitespace-only doesn't emit a URL param the server would treat as
+    'match everything.'"""
+    f = WatchFilter(product_name_contains="   ")
+    params = f.to_query_params()
+    assert "product_name_contains" not in params
+
+
+def test_filter_round_trip_with_product_name_contains(tmp_path: Path):
+    """profile.yaml round-trips a watch that uses product_name_contains."""
+    p = _make_profile()
+    p.watches[0].filter.product_name_contains = "AirPods 4"
+    path = tmp_path / "profile.yaml"
+    p.save(path)
+    loaded = Profile.load(path)
+    assert loaded.watches[0].filter.product_name_contains == "AirPods 4"
+
+
+def test_telegram_config_accepts_topic_id_env():
+    """v0.4.0: TelegramConfig schema surfaces topic_id_env so profiles can
+    route to a specific forum-topic without manual notifier construction."""
+    from kitsdeals_river.profile import TelegramConfig
+    cfg = TelegramConfig(
+        bot_token_env="TELEGRAM_BOT_TOKEN",
+        chat_id_env="TELEGRAM_CHAT_ID",
+        topic_id_env="TELEGRAM_OPS_TOPIC_ID",
+    )
+    assert cfg.topic_id_env == "TELEGRAM_OPS_TOPIC_ID"
+
+
+def test_telegram_config_topic_id_env_optional():
+    """Default of None preserves v0.3.x backwards-compat: topics fall back
+    to chat default thread when not set."""
+    from kitsdeals_river.profile import TelegramConfig
+    cfg = TelegramConfig()
+    assert cfg.topic_id_env is None
+
+
 def test_save_writes_meta_block(tmp_path: Path):
     """save() writes a top-level _meta with last_edited_by tracking."""
     p = _make_profile()

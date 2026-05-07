@@ -301,3 +301,98 @@ def test_reload_no_pid_file_returns_1(tmp_path: Path, capsys):
     rc = main(["reload", "--pid-file", str(tmp_path / "missing.pid")])
     assert rc == 1
     assert "no watcher running" in capsys.readouterr().err
+
+
+# ============================================================
+# v0.4.0: notify_threshold + multi-watch helper tests
+# ============================================================
+
+from kitsdeals_river.cli import (  # noqa: E402
+    _passes_threshold,
+    _watch_for_deal,
+    _sanitize_watch_label,
+)
+from kitsdeals_river.profile import Profile, Watch, WatchFilter  # noqa: E402
+
+
+def test_passes_threshold_anything_is_a_passthrough():
+    """anything tier never gates — everything notifies."""
+    assert _passes_threshold({"deal_score": 0}, "anything") is True
+    assert _passes_threshold({}, "anything") is True
+
+
+def test_passes_threshold_good_floor():
+    """good = deal_score >= 60."""
+    assert _passes_threshold({"deal_score": 59.9}, "good") is False
+    assert _passes_threshold({"deal_score": 60.0}, "good") is True
+    assert _passes_threshold({"deal_score": 100}, "good") is True
+
+
+def test_passes_threshold_clear_win_floor():
+    """clear_win = deal_score >= 80."""
+    assert _passes_threshold({"deal_score": 79.9}, "clear_win") is False
+    assert _passes_threshold({"deal_score": 80.0}, "clear_win") is True
+
+
+def test_passes_threshold_missing_score_below_anything_fails():
+    """Defensive: deal without a score can't be promised to clear good
+    or clear_win."""
+    assert _passes_threshold({}, "good") is False
+    assert _passes_threshold({"deal_score": None}, "clear_win") is False
+    # but anything still passes
+    assert _passes_threshold({}, "anything") is True
+
+
+def test_watch_for_deal_picks_first_match():
+    """When multiple watches are configured, the FIRST matching one
+    wins — its threshold applies."""
+    profile = Profile(
+        name="Tom",
+        watches=[
+            Watch(label="AirPods 4", filter=WatchFilter(
+                brand_in=["Apple"], product_name_contains="AirPods 4",
+            )),
+            Watch(label="All Apple", filter=WatchFilter(brand_in=["Apple"])),
+        ],
+    )
+    deal_a = {"brand": "Apple", "product_name": "AirPods 4 Wireless Earbuds", "category": "electronics"}
+    deal_b = {"brand": "Apple", "product_name": "iPad Mini", "category": "electronics"}
+
+    assert _watch_for_deal(profile, deal_a).label == "AirPods 4"
+    assert _watch_for_deal(profile, deal_b).label == "All Apple"
+
+
+def test_watch_for_deal_filters_correctly():
+    """Each filter dimension is honored: brand, condition, price,
+    discount, product_name_contains."""
+    profile = Profile(
+        name="Tom",
+        watches=[Watch(label="AP4", filter=WatchFilter(
+            brand_in=["Apple"],
+            condition_in=["new", "open_box"],
+            max_price_cents=18000,
+            min_discount_pct=10,
+            product_name_contains="AirPods 4",
+        ))],
+    )
+    base = {
+        "brand": "Apple", "category": "electronics",
+        "product_name": "AirPods 4 Wireless",
+        "condition": "new", "current_price_cents": 14900, "discount_pct": 25,
+    }
+    assert _watch_for_deal(profile, base) is not None
+
+    assert _watch_for_deal(profile, {**base, "brand": "Sony"}) is None
+    assert _watch_for_deal(profile, {**base, "condition": "refurbished"}) is None
+    assert _watch_for_deal(profile, {**base, "current_price_cents": 19000}) is None
+    assert _watch_for_deal(profile, {**base, "discount_pct": 5}) is None
+    assert _watch_for_deal(profile, {**base, "product_name": "AirPods Pro"}) is None
+
+
+def test_sanitize_watch_label():
+    assert _sanitize_watch_label("Apple AirPods 4") == "apple-airpods-4"
+    assert _sanitize_watch_label("TVs (LG / Sony)") == "tvs-lg-sony"
+    assert _sanitize_watch_label("   weird   spaces  ") == "weird-spaces"
+    # All non-alnum collapses to "default" rather than empty
+    assert _sanitize_watch_label("///") == "default"
+    assert _sanitize_watch_label("") == "default"

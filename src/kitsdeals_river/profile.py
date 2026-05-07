@@ -36,6 +36,11 @@ class WatchFilter(BaseModel):
     condition_in: list[str] | None = None
     max_price_cents: int | None = None
     min_discount_pct: float | None = None
+    # PR 52 (server) / SDK v0.4.0: case-insensitive substring match against
+    # deal.product_name. Useful for narrowing inside a brand without false
+    # positives — e.g. brand_in=["Apple"] + product_name_contains="AirPods 4"
+    # excludes other AirPods models. Single value, not a list.
+    product_name_contains: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -65,6 +70,13 @@ class WatchFilter(BaseModel):
                 if float(self.min_discount_pct).is_integer()
                 else str(self.min_discount_pct)
             )
+        if self.product_name_contains:
+            # Strip on emit — empty/whitespace-only stays unset rather than
+            # sending a URL param the server would silently treat as
+            # "match everything."
+            v = self.product_name_contains.strip()
+            if v:
+                params["product_name_contains"] = v
         return params
 
 
@@ -81,6 +93,12 @@ class Watch(BaseModel):
 class TelegramConfig(BaseModel):
     bot_token_env: str = "TELEGRAM_BOT_TOKEN"
     chat_id_env: str = "TELEGRAM_CHAT_ID"
+    # SDK v0.4.0: optional message_thread_id env-var name. Lets profiles
+    # route deliveries to a specific forum-topic in a Telegram supergroup
+    # (the notifier internals already supported topic_id_env at construction
+    # time but the profile schema didn't surface it). When unset, messages
+    # land in the chat's default thread — same behavior as before.
+    topic_id_env: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 

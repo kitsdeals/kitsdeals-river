@@ -75,8 +75,9 @@ Humans rarely run these directly; the skills tell the agent how to use
 them.
 
 ```bash
-kitsdeals-river setup --json '<full profile JSON>'      # write profile + start
-kitsdeals-river run                                     # foreground watcher
+kitsdeals-river setup --json '<full profile JSON>'      # write profile to disk
+kitsdeals-river run                                     # foreground watcher (start here, or via systemd)
+kitsdeals-river run --initial-backfill                  # also surface currently-live matching deals on first start
 kitsdeals-river status                                  # daemon health snapshot
 kitsdeals-river reload                                  # SIGHUP a running watcher
 kitsdeals-river profile show [--json]                   # inspect current profile
@@ -84,8 +85,38 @@ kitsdeals-river profile update --remove-watch "TVs"     # programmatic edits
 kitsdeals-river profile validate                        # well-formedness check
 ```
 
+`setup` writes the profile only — it does **not** start the watcher.
+`run` (or a systemd unit invoking `run`) is what actually opens the SSE
+connection. Treat them as separate concerns: one configures, the other
+keeps the daemon alive.
+
 See `skills/onboarding.md` and `skills/update-profile.md` for the agent-
 facing recipes.
+
+## Multiple watches
+
+Profiles can declare multiple watches (`profile.watches[]`). When more
+than one is present, `kitsdeals-river run` opens **one SSE connection
+per watch** concurrently in a single process — each with its own
+filter, its own cursor file (`<cursor>-<sanitized-label>.json`), and
+its own `notify_threshold`. A deal that matches multiple watches is
+delivered on each matching connection; the default handler dedupes by
+deal id and routes to the first matching watch's threshold.
+
+## Notify thresholds
+
+Each watch declares a `notify_threshold` ∈ `{anything, good, clear_win}`
+that gates which matched deals actually fire a notification. Mapping
+against the server's deal-quality score (`deal_score`, 0–100):
+
+| threshold | floor | when to use |
+|---|---|---|
+| `anything` | none — every match notifies | broad watches you actively want noisy |
+| `good` | `deal_score ≥ 60` | typical default; filters out obvious lemons |
+| `clear_win` | `deal_score ≥ 80` | only-the-best alerts; lots will be filtered |
+
+Deals lacking `deal_score` only notify when `notify_threshold` is
+`anything` — refuse-to-guess posture.
 
 ## Minimal example (without an agent in the loop)
 

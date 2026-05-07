@@ -22,7 +22,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import ValidationError
 
@@ -336,6 +336,22 @@ def cmd_status(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _sanitize_watch_label(label: str) -> str:
+    """Make a label safe to use in a cursor filename. Lowercase, replace
+    runs of non-alphanumeric with a single dash, strip leading/trailing
+    dashes. "Apple AirPods 4" → "apple-airpods-4"."""
+    out = []
+    last_dash = False
+    for c in label.lower():
+        if c.isalnum():
+            out.append(c)
+            last_dash = False
+        elif not last_dash:
+            out.append("-")
+            last_dash = True
+    return "".join(out).strip("-") or "default"
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     profile = _load_profile_or_die(args.profile)
     pid_path = _resolve(args.pid_file or DEFAULT_PID_PATH)
@@ -359,24 +375,98 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     pid_path.write_text(str(os.getpid()))
 
-    # Load filter from profile. The reload callback re-reads on SIGHUP.
-    def reload_filter() -> WatchFilter | None:
-        return _load_profile_or_die(args.profile).watches[0].filter if (
-            _load_profile_or_die(args.profile).watches
-        ) else None
+    if not profile.watches:
+        print("Error: profile has no watches; nothing to do", file=sys.stderr)
+        return 1
 
-    initial_filter = profile.watches[0].filter if profile.watches else None
+    api_base = args.api_base or "https://api.kitsdeals.com"
+    initial_backfill = bool(getattr(args, "initial_backfill", False))
+    handler = _make_default_handler(profile, args)
 
-    watcher = RiverWatcher(
-        api_base=args.api_base or "https://api.kitsdeals.com",
-        filter=initial_filter,
-        cursor_path=args.cursor or DEFAULT_CURSOR_PATH,
-        on_event=_make_default_handler(profile, args),
-        reload_profile=reload_filter,
+    # SDK v0.4.0: support multiple watches in a single profile by running
+    # one RiverWatcher per watch concurrently. Each watch gets its own
+    # cursor file (suffixed by sanitized label) so cursors don't stomp
+    # each other. Single-watch profiles keep the original cursor path
+    # for backwards compatibility with v0.3.x setups.
+    watches = profile.watches
+    if len(watches) == 1:
+        watch = watches[0]
+        cursor_path = args.cursor or DEFAULT_CURSOR_PATH
+
+        def reload_filter() -> WatchFilter | None:
+            reloaded = _load_profile_or_die(args.profile)
+            return reloaded.watches[0].filter if reloaded.watches else None
+
+        watcher = RiverWatcher(
+            api_base=api_base,
+            filter=watch.filter,
+            cursor_path=cursor_path,
+            on_event=handler,
+            reload_profile=reload_filter,
+            initial_backfill=initial_backfill,
+        )
+        try:
+            watcher.run()
+        finally:
+            try:
+                pid_path.unlink()
+            except OSError:
+                pass
+        return 0
+
+    # Multi-watch path: one RiverWatcher per watch, run concurrently.
+    # Cursor paths are derived from the user-supplied --cursor base by
+    # inserting the sanitized label before the .json extension. So
+    # --cursor=~/.kitsdeals/cursor.json with watches "AirPods 4" and
+    # "Frame TV" gives cursor-airpods-4.json and cursor-frame-tv.json.
+    base_cursor = Path(args.cursor or DEFAULT_CURSOR_PATH).expanduser()
+    cursor_dir = base_cursor.parent
+    cursor_stem = base_cursor.stem
+    cursor_suffix = base_cursor.suffix or ".json"
+
+    def cursor_for(label: str) -> Path:
+        return cursor_dir / f"{cursor_stem}-{_sanitize_watch_label(label)}{cursor_suffix}"
+
+    # Build watchers. Reload returns the matching label's filter from
+    # the freshly-loaded profile; if a watch was removed from the
+    # profile mid-flight, returning None drops filtering for that
+    # watcher (which is degenerate but won't crash).
+    watchers: list[RiverWatcher] = []
+    for watch in watches:
+        label = watch.label
+
+        def make_reload(_label: str) -> Callable[[], WatchFilter | None]:
+            def _reload() -> WatchFilter | None:
+                reloaded = _load_profile_or_die(args.profile)
+                for w in reloaded.watches:
+                    if w.label == _label:
+                        return w.filter
+                return None
+            return _reload
+
+        watchers.append(RiverWatcher(
+            api_base=api_base,
+            filter=watch.filter,
+            cursor_path=cursor_for(label),
+            on_event=handler,
+            reload_profile=make_reload(label),
+            initial_backfill=initial_backfill,
+        ))
+
+    print(
+        f"[cli] Running {len(watchers)} watcher(s) concurrently: "
+        f"{', '.join(w.label for w in watches)}",
+        file=sys.stderr,
     )
 
+    async def _run_all() -> None:
+        await asyncio.gather(*(w.run_async() for w in watchers))
+
     try:
-        watcher.run()
+        asyncio.run(_run_all())
+    except KeyboardInterrupt:
+        for w in watchers:
+            w.stop()
     finally:
         try:
             pid_path.unlink()
@@ -385,23 +475,99 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+# SDK v0.4.0: deal_score thresholds for notify_threshold semantics.
+# The river event payload's `deal_score` field is a 0-100 quality score
+# (PR 7 deal-quality scorer on the server). Map the tier names to score
+# floors:
+#   "anything"  → notify on every match (no threshold gate)
+#   "good"      → score >= 60
+#   "clear_win" → score >= 80
+# When a deal lacks deal_score (legacy / partial events), only "anything"
+# notifies — refuse to guess.
+_NOTIFY_THRESHOLD_FLOORS = {
+    "anything": None,   # no gate
+    "good": 60.0,
+    "clear_win": 80.0,
+}
+
+
+def _passes_threshold(deal: dict, threshold: str) -> bool:
+    floor = _NOTIFY_THRESHOLD_FLOORS.get(threshold)
+    if floor is None:  # "anything" or unknown tier
+        return True
+    score = deal.get("deal_score")
+    if not isinstance(score, (int, float)):
+        return False  # no score → can't promise it meets the bar
+    return float(score) >= floor
+
+
+def _watch_for_deal(profile: Profile, deal: dict) -> "Watch | None":
+    """Find the FIRST watch in the profile whose filter the deal would
+    match. The filter logic mirrors the server's: lowercase compare on
+    brand_in / condition_in / category, plus product_name_contains
+    substring. Used for per-deal threshold dispatch when multiple
+    watches are configured (each watch can declare its own
+    notify_threshold)."""
+    for watch in profile.watches:
+        f = watch.filter
+        if f.category and (deal.get("category") or "").lower() != f.category.lower():
+            continue
+        if f.brand_in:
+            brand = (deal.get("brand") or "").lower()
+            if not brand or brand not in f.brand_in:
+                continue
+        if f.condition_in:
+            cond = (deal.get("condition") or "new").lower()
+            if cond not in f.condition_in:
+                continue
+        if f.max_price_cents is not None:
+            price = deal.get("current_price_cents")
+            if price is None or price > f.max_price_cents:
+                continue
+        if f.min_discount_pct is not None:
+            disc = deal.get("discount_pct")
+            if disc is None or disc < f.min_discount_pct:
+                continue
+        if f.product_name_contains:
+            name = deal.get("product_name") or ""
+            if f.product_name_contains.strip().lower() not in name.lower():
+                continue
+        return watch
+    return None
+
+
 def _make_default_handler(profile: Profile, args: argparse.Namespace):
     """Build the default per-event handler from the profile.
 
     Default behavior: log + notify via the configured channel for any
-    deal event that passes the watch filter. No agent-evaluator wiring
-    yet — that's what skills/onboarding.md will show the agent how to
-    customize. PR 38 ships the dual-emit (telegram + spawn-claude)
-    template based on Kit's setup.
+    deal event that passes the watch filter AND clears the watch's
+    notify_threshold. No agent-evaluator wiring yet — that's what
+    skills/onboarding.md will show the agent how to customize. PR 38
+    ships the dual-emit (telegram + spawn-claude) template based on
+    Kit's setup.
+
+    SDK v0.4.0: enforces per-watch notify_threshold (was stored but
+    ignored in v0.3.x — Kit's audit found "changing threshold doesn't
+    affect notification volume"). Also routes per-deal to the FIRST
+    matching watch when multiple are configured, so each watch's
+    threshold applies to its own matches.
     """
     from .notify import StdoutNotifier, TelegramNotifier
 
     if profile.notify.channel == "telegram" and profile.notify.telegram:
         cfg = profile.notify.telegram
-        notifier = TelegramNotifier(
-            bot_token_env=cfg.bot_token_env,
-            chat_id_env=cfg.chat_id_env,
-        )
+        # SDK v0.4.0: pass topic_id_env through when the profile sets it,
+        # so forum-topic routing works without manual notifier construction.
+        # Default of "TELEGRAM_TOPIC_ID" still kicks in for callers that
+        # set the env var without setting profile.notify.telegram.topic_id_env
+        # — keeps backwards compat with v0.3.x env-only setups.
+        notifier_kwargs = {
+            "bot_token_env": cfg.bot_token_env,
+            "chat_id_env": cfg.chat_id_env,
+        }
+        if cfg.topic_id_env:
+            notifier_kwargs["topic_id_env"] = cfg.topic_id_env
+        notifier = TelegramNotifier(**notifier_kwargs)
     else:
         notifier = StdoutNotifier()
 
@@ -410,6 +576,29 @@ def _make_default_handler(profile: Profile, args: argparse.Namespace):
             return
         deal = event.data
         if profile.matches_owned(deal) or profile.matches_blacklist(deal):
+            return
+        # SDK v0.4.0: find which watch this deal matches and apply its
+        # notify_threshold. When watches share a single SSE connection
+        # this is the only correct place to do it (the server doesn't
+        # know about thresholds). With per-watch SSE (multi-watch
+        # mode) the deal will only arrive on the matching watch's
+        # connection anyway — but we still need to re-check here
+        # because both modes route through the same handler factory.
+        watch = _watch_for_deal(profile, deal)
+        if watch is None:
+            # Defensive: server delivered an event our local view of
+            # the filter wouldn't have matched. Could happen during
+            # mid-flight reload when filter changed; safer to skip
+            # than over-notify.
+            return
+        if not _passes_threshold(deal, watch.notify_threshold):
+            logger.debug(
+                "deal %s skipped: deal_score=%s below threshold=%s for watch=%s",
+                deal.get("id", "?"),
+                deal.get("deal_score"),
+                watch.notify_threshold,
+                watch.label,
+            )
             return
         brand = deal.get("brand", "?")
         ptype = deal.get("product_type", "")
@@ -487,6 +676,17 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--api-base", help="Default: https://api.kitsdeals.com")
     rn.add_argument("--cursor", help=f"Default: {DEFAULT_CURSOR_PATH}")
     rn.add_argument("--pid-file", help=f"Default: {DEFAULT_PID_PATH}")
+    rn.add_argument(
+        "--initial-backfill",
+        action="store_true",
+        help=(
+            "On first start (cursor empty), fetch recent-window deals "
+            "matching the watch's coarse filters via /v1/deals and "
+            "dispatch them through the notifier. Closes the gap where a "
+            "freshly-configured watch would otherwise miss every "
+            "currently-live matching deal until the next deal lands."
+        ),
+    )
     rn.set_defaults(func=cmd_run)
 
     return p
